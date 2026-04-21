@@ -4,7 +4,7 @@ import { generateXLSX, generateCSV } from '@/lib/export';
 
 export async function GET(req: NextRequest) {
   const token = req.cookies.get('admin_token')?.value || '';
-  if (!validateSession(token)) {
+  if (!(await validateSession(token))) {
     return NextResponse.json({ error: 'unauthorized' }, { status: 401 });
   }
 
@@ -12,7 +12,7 @@ export async function GET(req: NextRequest) {
   const date = new Date().toISOString().split('T')[0];
 
   if (format === 'csv') {
-    const csv = generateCSV();
+    const csv = await generateCSV();
     return new NextResponse(csv, {
       headers: {
         'Content-Type': 'text/csv; charset=utf-8',
@@ -21,7 +21,7 @@ export async function GET(req: NextRequest) {
     });
   }
 
-  const buffer = generateXLSX();
+  const buffer = await generateXLSX();
   return new NextResponse(buffer as unknown as BodyInit, {
     headers: {
       'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from 'next/server';
-import db from '@/lib/db';
+import { sql, ensureTables } from '@/lib/db';
 import { checkRateLimit, getClientIP } from '@/lib/ratelimit';
 import { fetchPageSpeed } from '@/lib/pagespeed';
 import { checkSite } from '@/lib/sitecheck';
@@ -24,8 +24,10 @@ function isValidEmail(email: string): boolean {
 }
 
 export async function POST(req: NextRequest) {
+  await ensureTables();
+
   const ip = getClientIP(req.headers);
-  const rateCheck = checkRateLimit(ip);
+  const rateCheck = await checkRateLimit(ip);
 
   if (!rateCheck.allowed) {
     return NextResponse.json(
@@ -62,22 +64,24 @@ export async function POST(req: NextRequest) {
   const rawUrl = website_url!.trim();
   const normalizedUrl = rawUrl.startsWith('http') ? rawUrl : `https://${rawUrl}`;
 
-  const leadInsert = db.prepare(`
+  // Insert lead and get new ID
+  const insertRows = await sql`
     INSERT INTO leads (website_url, email, category, language, ip_address, user_agent, status)
-    VALUES (?, ?, ?, ?, ?, ?, 'pending')
-  `).run(normalizedUrl, email, category, lang, ip, ua);
-
-  const leadId = leadInsert.lastInsertRowid;
+    VALUES (${normalizedUrl}, ${email}, ${category}, ${lang}, ${ip}, ${ua}, 'pending')
+    RETURNING id
+  `;
+  const leadId = (insertRows[0] as { id: number }).id;
 
   try {
     const competitorDomains = getCompetitors(category!);
 
     // Run PageSpeed + SiteCheck for user, PageSpeed for competitors — all in parallel
-    const [userPageSpeedSettled, userSiteCheckSettled, ...compFetches] = await Promise.allSettled([
-      fetchPageSpeed(normalizedUrl),
-      checkSite(normalizedUrl),
-      ...competitorDomains.map(d => fetchPageSpeed(d)),
-    ]);
+    const [userPageSpeedSettled, userSiteCheckSettled, ...compFetches] =
+      await Promise.allSettled([
+        fetchPageSpeed(normalizedUrl),
+        checkSite(normalizedUrl),
+        ...competitorDomains.map(d => fetchPageSpeed(d)),
+      ]);
 
     const userResult =
       userPageSpeedSettled.status === 'fulfilled'
@@ -109,7 +113,6 @@ export async function POST(req: NextRequest) {
       { ...userResult, isUser: true },
       ...competitorResults.map(r => ({ ...r, isUser: false })),
     ];
-
     allResults.sort((a, b) => b.overall - a.overall);
 
     const rankPosition = allResults.findIndex(r => r.isUser) + 1;
@@ -134,34 +137,23 @@ export async function POST(req: NextRequest) {
       siteCheck ?? undefined
     );
 
-    db.prepare(`
+    await sql`
       UPDATE leads SET
-        status = 'completed',
-        completed_at = CURRENT_TIMESTAMP,
-        score_overall = ?,
-        score_performance = ?,
-        score_seo = ?,
-        score_accessibility = ?,
-        score_best_practices = ?,
-        fcp = ?, lcp = ?, tbt = ?,
-        rank_position = ?,
-        rank_total = ?,
-        competitors_json = ?
-      WHERE id = ?
-    `).run(
-      userResult.overall,
-      userResult.performance,
-      userResult.seo,
-      userResult.accessibility,
-      userResult.bestPractices,
-      userResult.fcp,
-      userResult.lcp,
-      userResult.tbt,
-      rankPosition,
-      rankTotal,
-      JSON.stringify(allResults.filter(r => !r.isUser)),
-      leadId
-    );
+        status               = 'completed',
+        completed_at         = NOW(),
+        score_overall        = ${userResult.overall},
+        score_performance    = ${userResult.performance},
+        score_seo            = ${userResult.seo},
+        score_accessibility  = ${userResult.accessibility},
+        score_best_practices = ${userResult.bestPractices},
+        fcp                  = ${userResult.fcp},
+        lcp                  = ${userResult.lcp},
+        tbt                  = ${userResult.tbt},
+        rank_position        = ${rankPosition},
+        rank_total           = ${rankTotal},
+        competitors_json     = ${JSON.stringify(allResults.filter(r => !r.isUser))}
+      WHERE id = ${leadId}
+    `;
 
     return NextResponse.json({
       user: userResult,
@@ -175,7 +167,7 @@ export async function POST(req: NextRequest) {
       siteCheck,
     });
   } catch (err) {
-    db.prepare(`UPDATE leads SET status = 'failed' WHERE id = ?`).run(leadId);
+    await sql`UPDATE leads SET status = 'failed' WHERE id = ${leadId}`;
     return NextResponse.json({ error: 'analysis_failed', message: String(err) }, { status: 500 });
   }
 }

@@ -1,64 +1,68 @@
-import Database from 'better-sqlite3';
-import path from 'path';
-import fs from 'fs';
+import { neon } from '@neondatabase/serverless';
 
-const DB_PATH = process.env.DB_PATH || './data/leads.db';
-const dbDir = path.dirname(DB_PATH);
-
-if (!fs.existsSync(dbDir)) {
-  fs.mkdirSync(dbDir, { recursive: true });
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL environment variable is not set');
 }
 
-const db = new Database(DB_PATH);
+export const sql = neon(process.env.DATABASE_URL);
 
-db.pragma('journal_mode = WAL');
-db.pragma('foreign_keys = ON');
+// In-memory flag — avoids re-running CREATE IF NOT EXISTS on every call
+// within the same serverless instance lifetime
+let initialized = false;
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS leads (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    website_url TEXT NOT NULL,
-    email TEXT NOT NULL,
-    category TEXT,
-    language TEXT DEFAULT 'ro',
-    ip_address TEXT,
-    user_agent TEXT,
-    status TEXT DEFAULT 'pending',
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    completed_at DATETIME,
-    score_overall INTEGER,
-    score_performance INTEGER,
-    score_seo INTEGER,
-    score_accessibility INTEGER,
-    score_best_practices INTEGER,
-    fcp TEXT,
-    lcp TEXT,
-    tbt TEXT,
-    rank_position INTEGER,
-    rank_total INTEGER,
-    competitors_json TEXT
-  );
+export async function ensureTables(): Promise<void> {
+  if (initialized) return;
 
-  CREATE TABLE IF NOT EXISTS ip_usage (
-    ip_address TEXT NOT NULL,
-    date TEXT NOT NULL,
-    scan_count INTEGER DEFAULT 0,
-    last_scan_at DATETIME,
-    PRIMARY KEY (ip_address, date)
-  );
+  await sql`
+    CREATE TABLE IF NOT EXISTS leads (
+      id          BIGSERIAL PRIMARY KEY,
+      website_url TEXT NOT NULL,
+      email       TEXT NOT NULL,
+      category    TEXT,
+      language    TEXT DEFAULT 'ro',
+      ip_address  TEXT,
+      user_agent  TEXT,
+      status      TEXT DEFAULT 'pending',
+      created_at  TIMESTAMPTZ DEFAULT NOW(),
+      completed_at TIMESTAMPTZ,
+      score_overall       INTEGER,
+      score_performance   INTEGER,
+      score_seo           INTEGER,
+      score_accessibility INTEGER,
+      score_best_practices INTEGER,
+      fcp TEXT,
+      lcp TEXT,
+      tbt TEXT,
+      rank_position INTEGER,
+      rank_total    INTEGER,
+      competitors_json TEXT
+    )
+  `;
 
-  CREATE TABLE IF NOT EXISTS admin_sessions (
-    token TEXT PRIMARY KEY,
-    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    expires_at DATETIME NOT NULL
-  );
+  await sql`
+    CREATE TABLE IF NOT EXISTS ip_usage (
+      ip_address TEXT NOT NULL,
+      date       TEXT NOT NULL,
+      scan_count INTEGER DEFAULT 0,
+      last_scan_at TIMESTAMPTZ,
+      PRIMARY KEY (ip_address, date)
+    )
+  `;
 
-  CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at DESC);
-  CREATE INDEX IF NOT EXISTS idx_leads_email ON leads(email);
-  CREATE INDEX IF NOT EXISTS idx_ip_usage ON ip_usage(ip_address, date);
-`);
+  await sql`
+    CREATE TABLE IF NOT EXISTS admin_sessions (
+      token      TEXT PRIMARY KEY,
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      expires_at TIMESTAMPTZ NOT NULL
+    )
+  `;
 
-// Cleanup old ip_usage records on startup
-db.prepare(`DELETE FROM ip_usage WHERE date < date('now', '-7 days')`).run();
+  await sql`CREATE INDEX IF NOT EXISTS idx_leads_created ON leads(created_at DESC)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_leads_email   ON leads(email)`;
+  await sql`CREATE INDEX IF NOT EXISTS idx_ip_usage      ON ip_usage(ip_address, date)`;
 
-export default db;
+  // Clean old rate-limit rows (>7 days)
+  await sql`DELETE FROM ip_usage WHERE date < (CURRENT_DATE - INTERVAL '7 days')::TEXT`;
+
+  initialized = true;
+}

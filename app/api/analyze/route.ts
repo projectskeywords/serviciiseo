@@ -23,11 +23,65 @@ function isValidEmail(email: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim());
 }
 
-export async function POST(req: NextRequest) {
-  await ensureTables();
+/** Safe DB insert — returns lead ID or null if DB is not configured */
+async function dbInsertLead(
+  normalizedUrl: string, email: string, category: string,
+  lang: string, ip: string, ua: string
+): Promise<number | null> {
+  try {
+    await ensureTables();
+    const rows = await sql`
+      INSERT INTO leads (website_url, email, category, language, ip_address, user_agent, status)
+      VALUES (${normalizedUrl}, ${email}, ${category}, ${lang}, ${ip}, ${ua}, 'pending')
+      RETURNING id
+    `;
+    return (rows[0] as { id: number }).id;
+  } catch (err) {
+    console.error('[DB] insert lead failed:', err);
+    return null;
+  }
+}
 
+async function dbUpdateLead(leadId: number, data: Record<string, unknown>): Promise<void> {
+  try {
+    await sql`
+      UPDATE leads SET
+        status               = 'completed',
+        completed_at         = NOW(),
+        score_overall        = ${data.overall as number},
+        score_performance    = ${data.performance as number},
+        score_seo            = ${data.seo as number},
+        score_accessibility  = ${data.accessibility as number},
+        score_best_practices = ${data.bestPractices as number},
+        fcp                  = ${data.fcp as string},
+        lcp                  = ${data.lcp as string},
+        tbt                  = ${data.tbt as string},
+        rank_position        = ${data.rankPosition as number},
+        rank_total           = ${data.rankTotal as number},
+        competitors_json     = ${data.competitorsJson as string}
+      WHERE id = ${leadId}
+    `;
+  } catch (err) {
+    console.error('[DB] update lead failed:', err);
+  }
+}
+
+async function dbFailLead(leadId: number): Promise<void> {
+  try {
+    await sql`UPDATE leads SET status = 'failed' WHERE id = ${leadId}`;
+  } catch { /* ignore */ }
+}
+
+export async function POST(req: NextRequest) {
   const ip = getClientIP(req.headers);
-  const rateCheck = await checkRateLimit(ip);
+
+  // Rate limit — gracefully allow if DB unavailable
+  let rateCheck = { allowed: true, remaining: 999, resetAt: 'never' };
+  try {
+    rateCheck = await checkRateLimit(ip);
+  } catch (err) {
+    console.error('[RateLimit] error (allowing request):', err);
+  }
 
   if (!rateCheck.allowed) {
     return NextResponse.json(
@@ -64,16 +118,11 @@ export async function POST(req: NextRequest) {
   const rawUrl = website_url!.trim();
   const normalizedUrl = rawUrl.startsWith('http') ? rawUrl : `https://${rawUrl}`;
 
-  // Insert lead and get new ID
-  const insertRows = await sql`
-    INSERT INTO leads (website_url, email, category, language, ip_address, user_agent, status)
-    VALUES (${normalizedUrl}, ${email}, ${category}, ${lang}, ${ip}, ${ua}, 'pending')
-    RETURNING id
-  `;
-  const leadId = (insertRows[0] as { id: number }).id;
+  // Insert lead (DB is optional — analysis runs even without DB)
+  const leadId = await dbInsertLead(normalizedUrl, email!, category!, lang, ip, ua);
 
   try {
-    const competitorDomains = getCompetitors(category!);
+    const competitorDomains = await getCompetitors(category!);
 
     // Run PageSpeed + SiteCheck for user, PageSpeed for competitors — all in parallel
     const [userPageSpeedSettled, userSiteCheckSettled, ...compFetches] =
@@ -88,19 +137,17 @@ export async function POST(req: NextRequest) {
         ? userPageSpeedSettled.value
         : {
             url: normalizedUrl,
-            performance: 0,
-            seo: 0,
-            accessibility: 0,
-            bestPractices: 0,
-            fcp: 'N/A',
-            lcp: 'N/A',
-            tbt: 'N/A',
-            overall: 0,
+            performance: 0, seo: 0, accessibility: 0, bestPractices: 0,
+            fcp: 'N/A', lcp: 'N/A', tbt: 'N/A', overall: 0,
             error: 'Failed to fetch',
           };
 
     const siteCheck =
       userSiteCheckSettled.status === 'fulfilled' ? userSiteCheckSettled.value : null;
+
+    if (userSiteCheckSettled.status === 'rejected') {
+      console.error('[SiteCheck] failed:', userSiteCheckSettled.reason);
+    }
 
     const isDemo = userResult.isDemo === true;
 
@@ -119,55 +166,35 @@ export async function POST(req: NextRequest) {
     const rankTotal = allResults.length;
     const competitorAvg =
       competitorResults.length > 0
-        ? Math.round(
-            competitorResults.reduce((s, r) => s + r.overall, 0) / competitorResults.length
-          )
+        ? Math.round(competitorResults.reduce((s, r) => s + r.overall, 0) / competitorResults.length)
         : userResult.overall;
 
     const recommendations = getRecommendations(
-      {
-        performance: userResult.performance,
-        seo: userResult.seo,
-        accessibility: userResult.accessibility,
-        bestPractices: userResult.bestPractices,
-      },
-      rankPosition,
-      rankTotal,
-      lang,
-      siteCheck ?? undefined
+      { performance: userResult.performance, seo: userResult.seo, accessibility: userResult.accessibility, bestPractices: userResult.bestPractices },
+      rankPosition, rankTotal, lang, siteCheck ?? undefined
     );
 
-    await sql`
-      UPDATE leads SET
-        status               = 'completed',
-        completed_at         = NOW(),
-        score_overall        = ${userResult.overall},
-        score_performance    = ${userResult.performance},
-        score_seo            = ${userResult.seo},
-        score_accessibility  = ${userResult.accessibility},
-        score_best_practices = ${userResult.bestPractices},
-        fcp                  = ${userResult.fcp},
-        lcp                  = ${userResult.lcp},
-        tbt                  = ${userResult.tbt},
-        rank_position        = ${rankPosition},
-        rank_total           = ${rankTotal},
-        competitors_json     = ${JSON.stringify(allResults.filter(r => !r.isUser))}
-      WHERE id = ${leadId}
-    `;
+    // Persist to DB (non-blocking — analysis result is returned regardless)
+    if (leadId !== null) {
+      await dbUpdateLead(leadId, {
+        overall: userResult.overall, performance: userResult.performance,
+        seo: userResult.seo, accessibility: userResult.accessibility,
+        bestPractices: userResult.bestPractices,
+        fcp: userResult.fcp, lcp: userResult.lcp, tbt: userResult.tbt,
+        rankPosition, rankTotal,
+        competitorsJson: JSON.stringify(allResults.filter(r => !r.isUser)),
+      });
+    }
 
     return NextResponse.json({
-      user: userResult,
-      competitors: allResults,
-      rankPosition,
-      rankTotal,
-      competitorAvg,
-      recommendations,
-      remaining: rateCheck.remaining,
-      isDemo,
-      siteCheck,
+      user: userResult, competitors: allResults,
+      rankPosition, rankTotal, competitorAvg,
+      recommendations, remaining: rateCheck.remaining,
+      isDemo, siteCheck,
     });
   } catch (err) {
-    await sql`UPDATE leads SET status = 'failed' WHERE id = ${leadId}`;
+    if (leadId !== null) await dbFailLead(leadId);
+    console.error('[Analyze] error:', err);
     return NextResponse.json({ error: 'analysis_failed', message: String(err) }, { status: 500 });
   }
 }

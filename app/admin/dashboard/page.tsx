@@ -18,28 +18,42 @@ export default function AdminDashboard() {
   const [loading, setLoading] = useState(true);
 
   const fetchStats = useCallback(async () => {
-    const res = await fetch('/api/admin/stats');
-    if (res.status === 401) { router.push('/admin'); return; }
-    const data = await res.json();
-    setStats(data);
+    try {
+      const res = await fetch('/api/admin/stats');
+      if (res.status === 401) { router.push('/admin'); return; }
+      const data = await res.json();
+      setStats(data);
+    } catch (err) {
+      console.error('[Dashboard] fetchStats error:', err);
+    }
   }, [router]);
 
   const fetchLeads = useCallback(async (p: number) => {
     setLoading(true);
-    const params = new URLSearchParams({ page: String(p) });
-    if (filters.from) params.set('from', filters.from);
-    if (filters.to) params.set('to', filters.to);
-    if (filters.lang) params.set('lang', filters.lang);
-    if (filters.status) params.set('status', filters.status);
-    if (filters.search) params.set('search', filters.search);
+    try {
+      const params = new URLSearchParams({ page: String(p) });
+      if (filters.from)   params.set('from',   filters.from);
+      if (filters.to)     params.set('to',     filters.to);
+      if (filters.lang)   params.set('lang',   filters.lang);
+      if (filters.status) params.set('status', filters.status);
+      if (filters.search) params.set('search', filters.search);
 
-    const res = await fetch(`/api/admin/leads?${params}`);
-    if (res.status === 401) { router.push('/admin'); return; }
-    const data = await res.json();
-    setLeads(data.leads);
-    setTotal(data.total);
-    setPages(data.pages);
-    setLoading(false);
+      const res = await fetch(`/api/admin/leads?${params}`);
+      if (res.status === 401) { router.push('/admin'); return; }
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ message: 'Unknown error' }));
+        console.error('[Dashboard] leads API error:', err);
+        return;
+      }
+      const data = await res.json();
+      setLeads(data.leads   ?? []);
+      setTotal(data.total   ?? 0);
+      setPages(data.pages   ?? 1);
+    } catch (err) {
+      console.error('[Dashboard] fetchLeads error:', err);
+    } finally {
+      setLoading(false);
+    }
   }, [filters, router]);
 
   useEffect(() => { fetchStats(); }, [fetchStats]);
